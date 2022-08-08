@@ -1,0 +1,66 @@
+name: Deploy Staging
+on: 
+  push:
+    # Deploy every changes to main branch
+    branches:
+      - main
+
+jobs:
+  ci:
+    uses: ./.github/workflows/ci.yml
+  ci-docker:
+    uses: ./.github/workflows/ci-docker.yml
+
+  deploy-staging:
+    runs-on: ubuntu-latest
+    needs: [ci, ci-docker]
+    steps:
+      - uses: actions/checkout@v2
+
+      - name: QEMU
+        uses: docker/setup-qemu-action@v1
+      
+      - name: Docker Buildx
+        uses: docker/setup-buildx-action@v1
+      
+      - name: Bump version and push tag
+        id: tagging
+        uses: mathieudutour/github-tag-action@v4.5
+        with:
+          github_token: ${{ secrets.GITHUB_TOKEN }}
+      
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v1
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: us-east-1
+
+      - name: Login to Amazon ECR
+        id: login-ecr
+        uses: aws-actions/amazon-ecr-login@v1
+
+      - name: Build, tag, and push image to Amazon ECR
+        env:
+          ECR_REGISTRY: ${{ steps.login-ecr.outputs.registry }}
+          ECR_REPOSITORY: cql-api
+          IMAGE_TAG: staging-${{ steps.tagging.outputs.new_version }}
+          IMAGE_TAG_LATEST: latest
+        run: |
+          DOCKER_BUILDKIT=1 docker build -t $ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG --target production .
+          docker tag $ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG $ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG_LATEST
+          docker push $ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG
+          docker push $ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG_LATEST
+
+      - name: Deploy beanstalk (Staging)
+        env:
+          IMAGE_TAG: staging-${{ steps.tagging.outputs.new_version }}
+          IMAGE_FULL: ${{ steps.login-ecr.outputs.registry }}/cql-api:staging-${{ steps.tagging.outputs.new_version }}
+          S3_BUCKET: cql-api
+          BEANSTALK_APP_NAME: cql-api
+          BEANSTALK_APP_ENVIRONMENT: cql-api-staging
+        run: |
+          echo "{\"AWSEBDockerrunVersion\":\"1\",\"Image\":{\"Name\":\"${IMAGE_FULL}\",\"Update\": \"true\"},\"Ports\":[{\"ContainerPort\":80}]}" > ${IMAGE_TAG}.aws.json
+          aws s3 cp ${IMAGE_TAG}.aws.json "s3://${S3_BUCKET}/${IMAGE_TAG}.aws.json"
+          aws elasticbeanstalk create-application-version --application-name "${BEANSTALK_APP_NAME}" --version-label "${IMAGE_TAG}" --source-bundle "S3Bucket=${S3_BUCKET},S3Key=${IMAGE_TAG}.aws.json"
+          aws elasticbeanstalk update-environment --environment-name "${BEANSTALK_APP_ENVIRONMENT}" --version-label "${IMAGE_TAG}"
